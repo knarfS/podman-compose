@@ -2769,7 +2769,7 @@ async def compose_up(compose: PodmanCompose, args):
     diff_hashes = [i for i in hashes if i and i != compose.yaml_hash]
     if args.force_recreate or len(diff_hashes):
         log.info("recreating: ...")
-        down_args = argparse.Namespace(**dict(args.__dict__, volumes=False))
+        down_args = argparse.Namespace(**dict(args.__dict__, volumes=False, rmi=None))
         await compose.commands["down"](compose, down_args)
         log.info("recreating: done\n\n")
     # args.no_recreate disables check for changes (which is not implemented)
@@ -2809,7 +2809,7 @@ async def compose_up(compose: PodmanCompose, args):
         log.info("Caught SIGINT or Ctrl+C, shutting down...")
         try:
             log.info("Shutting down gracefully, please wait...")
-            down_args = argparse.Namespace(**dict(args.__dict__, volumes=False))
+            down_args = argparse.Namespace(**dict(args.__dict__, volumes=False, rmi=None))
             await compose.commands["down"](compose, down_args)
         except Exception as e:
             log.error("Error during shutdown: %s", e)
@@ -2898,7 +2898,6 @@ async def compose_down(compose: PodmanCompose, args):
     containers = list(reversed(compose.containers))
 
     down_tasks = []
-
     for cnt in containers:
         if cnt["_service"] in excluded:
             continue
@@ -2919,8 +2918,10 @@ async def compose_down(compose: PodmanCompose, args):
         if cnt["_service"] in excluded:
             continue
         await compose.podman.run([], "rm", [cnt["name"]])
+
+    orphaned_images = set()
     if args.remove_orphans:
-        names = (
+        orphaned_containers = (
             (
                 await compose.podman.output(
                     [],
@@ -2930,13 +2931,15 @@ async def compose_down(compose: PodmanCompose, args):
                         f"label=io.podman.compose.project={compose.project_name}",
                         "-a",
                         "--format",
-                        "{{ .Names }}",
+                        "{{ .Image }} {{ .Names }}",
                     ],
                 )
             )
             .decode("utf-8")
             .splitlines()
         )
+        orphaned_images = {item.split()[0] for item in orphaned_containers}
+        names = {item.split()[1] for item in orphaned_containers}
         for name in names:
             await compose.podman.run([], "stop", [*podman_args, name])
         for name in names:
@@ -2952,6 +2955,17 @@ async def compose_down(compose: PodmanCompose, args):
             if volume_name in vol_names_to_keep:
                 continue
             await compose.podman.run([], "volume", ["rm", volume_name])
+    if args.rmi:
+        images_to_remove = set()
+        for cnt in containers:
+            if cnt["_service"] in excluded:
+                continue
+            if args.rmi == "local" and not is_local(cnt):
+                continue
+            images_to_remove.add(cnt["image"])
+        images_to_remove.update(orphaned_images)
+        log.debug("images to remove: %s", images_to_remove)
+        await compose.podman.run([], "rmi", ["--ignore", "--force"] + list(images_to_remove))
 
     if excluded:
         return
@@ -3436,6 +3450,15 @@ def compose_down_parse(parser):
         "--remove-orphans",
         action="store_true",
         help="Remove containers for services not defined in the Compose file.",
+    )
+    parser.add_argument(
+        "--rmi",
+        type=str,
+        nargs="?",
+        const="all",
+        choices=["local", "all"],
+        help="Remove images used by services. `local` remove only images that don't have a "
+        "custom tag. (`local` or `all`)",
     )
 
 
